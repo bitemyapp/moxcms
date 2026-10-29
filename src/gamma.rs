@@ -31,6 +31,7 @@ use crate::transform::PointeeSizeExpressible;
 use crate::*;
 use num_traits::AsPrimitive;
 use pxfm::*;
+use std::sync::{Arc, Mutex, PoisonError};
 
 #[inline]
 /// Linear transfer function for sRGB
@@ -950,27 +951,120 @@ impl TransferCharacteristics {
     where
         f32: AsPrimitive<T>,
     {
+        let values = self.gamma_values(N, bit_depth, T::FINITE);
         let mut table = Box::new([T::default(); BUCKET]);
-        let max_range = 1f64 / (N - 1) as f64;
-        let max_value = ((1 << bit_depth) - 1) as f64;
-        if T::FINITE {
-            for (v, output) in table.iter_mut().take(N).enumerate() {
-                *output = ((self.gamma(v as f64 * max_range) * max_value) as f32)
-                    .round()
-                    .as_();
-            }
-        } else {
-            for (v, output) in table.iter_mut().take(N).enumerate() {
-                *output = (self.gamma(v as f64 * max_range) as f32).as_();
-            }
+        for (output, value) in table.iter_mut().zip(values.iter()) {
+            *output = value.as_();
         }
         table
     }
+
+    /// The values of a gamma table of `n` entries, rounded at `bit_depth` for a table of
+    /// integers, computed once for each such table: every transform to a destination with
+    /// these characteristics (sRGB's, say) builds the same one, and each entry takes a `pow`.
+    fn gamma_values(self, n: usize, bit_depth: usize, round: bool) -> Arc<[f32]> {
+        let key = (self, n, if round { bit_depth } else { 0 }, round);
+        let cached = || {
+            let tables = GAMMA_VALUES.lock().unwrap_or_else(PoisonError::into_inner);
+            tables
+                .iter()
+                .find(|(table_key, _)| *table_key == key)
+                .map(|(_, values)| values.clone())
+        };
+        if let Some(values) = cached() {
+            return values;
+        }
+
+        let max_range = 1f64 / (n - 1) as f64;
+        let max_value = ((1 << bit_depth) - 1) as f64;
+        let values: Arc<[f32]> = (0..n)
+            .map(|v| {
+                let gamma = self.gamma(v as f64 * max_range);
+                if round {
+                    ((gamma * max_value) as f32).round()
+                } else {
+                    gamma as f32
+                }
+            })
+            .collect();
+
+        let mut tables = GAMMA_VALUES.lock().unwrap_or_else(PoisonError::into_inner);
+        if !tables.iter().any(|(table_key, _)| *table_key == key) {
+            tables.push((key, values.clone()));
+        }
+        values
+    }
 }
+
+/// Gamma tables' values by transfer characteristics, number of entries, bit depth (0 where
+/// they aren't rounded) and whether they're rounded; see
+/// [`TransferCharacteristics::gamma_values`]. There are only so many of each, so this stays
+/// small.
+type GammaValuesKey = (TransferCharacteristics, usize, usize, bool);
+static GAMMA_VALUES: Mutex<Vec<(GammaValuesKey, Arc<[f32]>)>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table as each entry is computed, without the values kept from table to table.
+    fn direct_gamma_table<
+        T: Default + Copy + 'static + PointeeSizeExpressible,
+        const BUCKET: usize,
+        const N: usize,
+    >(
+        tc: TransferCharacteristics,
+        bit_depth: usize,
+    ) -> Box<[T; BUCKET]>
+    where
+        f32: AsPrimitive<T>,
+    {
+        let mut table = Box::new([T::default(); BUCKET]);
+        let max_range = 1f64 / (N - 1) as f64;
+        let max_value = ((1 << bit_depth) - 1) as f64;
+        for (v, output) in table.iter_mut().take(N).enumerate() {
+            let gamma = tc.gamma(v as f64 * max_range);
+            *output = if T::FINITE {
+                ((gamma * max_value) as f32).round().as_()
+            } else {
+                (gamma as f32).as_()
+            };
+        }
+        table
+    }
+
+    #[test]
+    fn kept_gamma_values_make_the_same_tables() {
+        for tc in [
+            TransferCharacteristics::Srgb,
+            TransferCharacteristics::Bt709,
+            TransferCharacteristics::Smpte2084,
+            TransferCharacteristics::Linear,
+        ] {
+            // Twice each, so that the second comes from the values kept.
+            for _ in 0..2 {
+                assert!(
+                    tc.make_gamma_table::<u8, 65536, 4096>(8)
+                        == direct_gamma_table::<u8, 65536, 4096>(tc, 8)
+                );
+                assert!(
+                    tc.make_gamma_table::<u16, 65536, 4092>(8)
+                        == direct_gamma_table::<u16, 65536, 4092>(tc, 8)
+                );
+                assert!(
+                    tc.make_gamma_table::<u16, 65536, 16384>(12)
+                        == direct_gamma_table::<u16, 65536, 16384>(tc, 12)
+                );
+                let kept = tc.make_gamma_table::<f32, 65536, 32768>(1);
+                let direct = direct_gamma_table::<f32, 65536, 32768>(tc, 1);
+                assert!(
+                    kept.iter()
+                        .zip(direct.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+        }
+    }
 
     #[test]
     fn srgb_test() {
